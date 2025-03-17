@@ -14,8 +14,8 @@ Based on shroomjaks' project.
 2. Create a `.env` file:
    ```env
    TOKEN=your_discord_user_token_here
-   DISBOARD_CHANNELS=1349256969042661458
-   DISCADIA_CHANNELS=1351071414257586177
+   DISBOARD_CHANNELS=channel_id_1
+   DISCADIA_CHANNELS=channel_id_1
    DISCADIA_BUMP_HOUR=9
    ```
 
