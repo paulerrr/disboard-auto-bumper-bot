@@ -7,7 +7,6 @@ const disboardChannels = (process.env.DISBOARD_CHANNELS || '').split(',').filter
 const discadiaChannels = (process.env.DISCADIA_CHANNELS || '').split(',').filter(id => id.trim() !== '');
 
 // Hours (0-23) when Discadia should be bumped
-// Default to 9 (9 AM in the server's local time)
 const discadiaBumpHour = parseInt(process.env.DISCADIA_BUMP_HOUR || '9');
 
 // Configure specific channels for each service
@@ -16,22 +15,112 @@ const BUMP_CONFIG = {
         id: '302050872383242240',
         command: 'bump',
         interval: 2.1 * 60 * 60 * 1000, // 2.1 hours in milliseconds
-        channels: disboardChannels, // Disboard bump channels
-        lastBumped: {} // Timestamp of when this bot was last bumped in each channel
+        channels: disboardChannels,
+        lastBumped: {},       // Timestamp of when this bot was last bumped in each channel
+        successfulBumps: {},  // Count of successful bumps per channel
+        bumpAttempts: {}      // Count of bump attempts per channel
     },
     DISCADIA: {
         id: '1222548162741538938',
         command: 'bump',
-        interval: 3 * 24 * 60 * 60 * 1000, // 3 days in milliseconds for safety
-        channels: discadiaChannels, // Discadia bump channels
-        lastBumped: {}, // Timestamp of when this bot was last bumped in each channel
-        bumpHour: discadiaBumpHour, // Hour of the day to bump (in 24-hour format, server's local time)
-        lastResponse: {}, // Last response from Discadia for each channel
-        cooldownActive: {}, // Track if we're in a cooldown period for each channel
-        retryCount: {}, // Track retry attempts for each channel
-        nextScheduledAttempt: {} // Store timeout IDs for scheduled attempts
+        interval: 3 * 24 * 60 * 60 * 1000,
+        channels: discadiaChannels,
+        lastBumped: {},
+        bumpHour: discadiaBumpHour,
+        lastResponse: {},
+        cooldownActive: {},
+        retryCount: {},
+        nextScheduledAttempt: {}
     }
 };
+
+// Global message handler
+client.on('messageCreate', async (message) => {
+    // Process Disboard responses (public messages only)
+    if (message.author.id === BUMP_CONFIG.DISBOARD.id) {
+        const channelId = message.channel.id;
+        if (BUMP_CONFIG.DISBOARD.channels.includes(channelId)) {
+            // Check for successful bump messages
+            if (message.content.includes('Bump done!') || 
+                (message.embeds?.length > 0 && message.embeds.some(e => e.description?.includes('Bump done!')))) {
+                
+                // Record the successful bump
+                BUMP_CONFIG.DISBOARD.lastBumped[channelId] = Date.now();
+                BUMP_CONFIG.DISBOARD.successfulBumps[channelId] = (BUMP_CONFIG.DISBOARD.successfulBumps[channelId] || 0) + 1;
+                
+                console.log(`✅ CONFIRMED DISBOARD bump in channel ${channelId}!`);
+                console.log(`   Total successful bumps for this channel: ${BUMP_CONFIG.DISBOARD.successfulBumps[channelId]}`);
+                
+                // Log server name if available
+                try {
+                    const channel = await client.channels.fetch(channelId);
+                    console.log(`   Server: ${channel.guild.name}, Channel: ${channel.name}`);
+                } catch (error) {
+                    // Ignore errors here
+                }
+            }
+        }
+    }
+    
+    // Process Discadia responses
+    if (message.author.id === BUMP_CONFIG.DISCADIA.id) {
+        const channelId = message.channel.id;
+        if (BUMP_CONFIG.DISCADIA.channels.includes(channelId)) {
+            // Store the response
+            BUMP_CONFIG.DISCADIA.lastResponse[channelId] = message.content;
+            
+            // Check if this is a successful bump
+            if (message.content.includes('has been successfully bumped')) {
+                BUMP_CONFIG.DISCADIA.lastBumped[channelId] = Date.now();
+                BUMP_CONFIG.DISCADIA.cooldownActive[channelId] = false;
+                BUMP_CONFIG.DISCADIA.retryCount[channelId] = 0;
+                console.log(`✅ Confirmed successful Discadia bump in channel ${channelId}!`);
+                
+                // Reschedule next bump based on standard cooldown (24 hours plus safety)
+                scheduleNextDiscadiaBump(channelId);
+            }
+            
+            // Check if we're in a cooldown period
+            if (message.content.includes('Already bumped recently')) {
+                BUMP_CONFIG.DISCADIA.cooldownActive[channelId] = true;
+                
+                // Extract cooldown time if possible
+                let cooldownMatch = message.content.match(/try again (\d+) (hours?|days?) ago/);
+                if (!cooldownMatch) {
+                    cooldownMatch = message.content.match(/try again in (\d+) (hours?|days?)/);
+                }
+                
+                if (cooldownMatch) {
+                    const value = parseInt(cooldownMatch[1]);
+                    const unit = cooldownMatch[2];
+                    
+                    let cooldownMs = 0;
+                    if (unit.startsWith('hour')) {
+                        cooldownMs = value * 60 * 60 * 1000;
+                    } else if (unit.startsWith('day')) {
+                        cooldownMs = value * 24 * 60 * 60 * 1000;
+                    }
+                    
+                    // Add this to the current time as a safety margin and store it
+                    if (cooldownMs > 0) {
+                        const nextEligibleTime = Date.now() + cooldownMs + 60 * 60 * 1000; // Add an extra hour for safety
+                        BUMP_CONFIG.DISCADIA.lastBumped[channelId] = nextEligibleTime; 
+                        console.log(`⏰ Discadia cooldown detected in channel ${channelId}. Next eligible time: ${new Date(nextEligibleTime).toLocaleString()}`);
+                        
+                        // Reschedule with the new cooldown information
+                        scheduleNextDiscadiaBump(channelId);
+                    }
+                } else {
+                    // If we can't parse the time, use a default 24-hour cooldown
+                    BUMP_CONFIG.DISCADIA.lastBumped[channelId] = Date.now() + 24 * 60 * 60 * 1000;
+                    
+                    // Reschedule with the default cooldown
+                    scheduleNextDiscadiaBump(channelId);
+                }
+            }
+        }
+    }
+});
 
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
@@ -57,6 +146,12 @@ client.on('ready', async () => {
                 config.lastBumped[channelId] = 0;
             }
             
+            // Initialize service-specific tracking
+            if (serviceName === 'DISBOARD') {
+                if (!config.successfulBumps[channelId]) config.successfulBumps[channelId] = 0;
+                if (!config.bumpAttempts[channelId]) config.bumpAttempts[channelId] = 0;
+            }
+            
             // Initialize Discadia-specific tracking
             if (serviceName === 'DISCADIA') {
                 if (!config.lastResponse[channelId]) config.lastResponse[channelId] = '';
@@ -65,70 +160,6 @@ client.on('ready', async () => {
             }
         });
     }
-
-    // Set up message listener to capture Discadia responses
-    client.on('messageCreate', async (message) => {
-        // Only process messages from Discadia bot
-        if (message.author.id !== BUMP_CONFIG.DISCADIA.id) return;
-        
-        // Check if this is in a channel we're monitoring
-        const channelId = message.channel.id;
-        if (!BUMP_CONFIG.DISCADIA.channels.includes(channelId)) return;
-        
-        // Store the response
-        BUMP_CONFIG.DISCADIA.lastResponse[channelId] = message.content;
-        
-        // Check if this is a successful bump
-        if (message.content.includes('has been successfully bumped')) {
-            BUMP_CONFIG.DISCADIA.lastBumped[channelId] = Date.now();
-            BUMP_CONFIG.DISCADIA.cooldownActive[channelId] = false;
-            BUMP_CONFIG.DISCADIA.retryCount[channelId] = 0;
-            console.log(`Confirmed successful Discadia bump in channel ${channelId}!`);
-            
-            // Reschedule next bump based on standard cooldown (24 hours plus safety)
-            scheduleNextDiscadiaBump(channelId);
-        }
-        
-        // Check if we're in a cooldown period
-        if (message.content.includes('Already bumped recently')) {
-            BUMP_CONFIG.DISCADIA.cooldownActive[channelId] = true;
-            
-            // Extract cooldown time if possible
-            // Handle both "try again X days/hours ago" and "try again in X day/hour" formats
-            let cooldownMatch = message.content.match(/try again (\d+) (hours?|days?) ago/);
-            if (!cooldownMatch) {
-                cooldownMatch = message.content.match(/try again in (\d+) (hours?|days?)/);
-            }
-            
-            if (cooldownMatch) {
-                const value = parseInt(cooldownMatch[1]);
-                const unit = cooldownMatch[2];
-                
-                let cooldownMs = 0;
-                if (unit.startsWith('hour')) {
-                    cooldownMs = value * 60 * 60 * 1000;
-                } else if (unit.startsWith('day')) {
-                    cooldownMs = value * 24 * 60 * 60 * 1000;
-                }
-                
-                // Add this to the current time as a safety margin and store it
-                if (cooldownMs > 0) {
-                    const nextEligibleTime = Date.now() + cooldownMs + 60 * 60 * 1000; // Add an extra hour for safety
-                    BUMP_CONFIG.DISCADIA.lastBumped[channelId] = nextEligibleTime; 
-                    console.log(`Discadia cooldown detected in channel ${channelId}. Next eligible time: ${new Date(nextEligibleTime).toLocaleString()}`);
-                    
-                    // Reschedule with the new cooldown information
-                    scheduleNextDiscadiaBump(channelId);
-                }
-            } else {
-                // If we can't parse the time, use a default 24-hour cooldown
-                BUMP_CONFIG.DISCADIA.lastBumped[channelId] = Date.now() + 24 * 60 * 60 * 1000;
-                
-                // Reschedule with the default cooldown
-                scheduleNextDiscadiaBump(channelId);
-            }
-        }
-    });
 
     // Function to check if it's time to bump Discadia
     function isDiscadiaBumpTime(channelId) {
@@ -160,7 +191,6 @@ client.on('ready', async () => {
         }
         
         // Otherwise, only bump if the last bump was at least 22 hours ago
-        // This prevents bumping too frequently but still allows bumping as soon as eligible
         const minTimeBetweenBumps = 22 * 60 * 60 * 1000; // 22 hours in milliseconds
         return (lastBumpTime === 0 || (now.getTime() - lastBumpTime) >= minTimeBetweenBumps);
     }
@@ -174,46 +204,69 @@ client.on('ready', async () => {
                     // If we have a future timestamp for next eligible bump, inform when we'll try
                     if (botConfig.lastBumped[channelId] > Date.now()) {
                         const nextTime = new Date(botConfig.lastBumped[channelId]);
-                        console.log(`Skipping Discadia bump in channel ${channelId} - will try again on ${nextTime.toLocaleDateString()} at ${nextTime.toLocaleTimeString()}`);
+                        console.log(`⏳ Skipping Discadia bump in channel ${channelId} - will try again on ${nextTime.toLocaleDateString()} at ${nextTime.toLocaleTimeString()}`);
                     } else {
-                        console.log(`Skipping Discadia bump in channel ${channelId} - will bump at ${botConfig.bumpHour}:00 today`);
+                        console.log(`⏳ Skipping Discadia bump in channel ${channelId} - will bump at ${botConfig.bumpHour}:00 today`);
                     }
                     return false;
                 }
             } else {
-                // For interval-based services like Disboard, check if enough time has passed
+                // For Disboard, check if enough time has passed since last successful bump
                 const now = Date.now();
                 if (now - botConfig.lastBumped[channelId] < botConfig.interval) {
                     // Calculate remaining time until next bump
                     const timeRemaining = botConfig.interval - (now - botConfig.lastBumped[channelId]);
                     const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
                     const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
-                    console.log(`Skipping ${botName} bump in channel ${channelId} - next bump available in ${hoursRemaining}h ${minutesRemaining}m`);
+                    
+                    console.log(`⏳ Skipping ${botName} bump in channel ${channelId} - next bump available in ${hoursRemaining}h ${minutesRemaining}m`);
+                    
+                    // Try to get channel info for better logging
+                    try {
+                        const channel = await client.channels.fetch(channelId);
+                        console.log(`   Server: ${channel.guild.name}, Channel: ${channel.name}`);
+                    } catch (error) {
+                        // Ignore errors here
+                    }
+                    
                     return false; // Didn't bump because it's not time yet
                 }
             }
             
-            const channel = await client.channels.fetch(channelId);
+            // Try to fetch the channel
+            let channel;
+            try {
+                channel = await client.channels.fetch(channelId);
+            } catch (error) {
+                console.error(`❌ Error fetching channel ${channelId}: ${error.message}`);
+                return false;
+            }
+            
             if (channel) {
-                await channel.sendSlash(botConfig.id, botConfig.command);
-                
-                // For non-Discadia services, update timestamp immediately
-                // For Discadia, we update in the message listener for better accuracy
-                if (botName !== 'DISCADIA') {
-                    botConfig.lastBumped[channelId] = Date.now();
-                } else {
-                    // For Discadia, record that we attempted a bump
-                    botConfig.retryCount[channelId]++;
+                // Track the attempt
+                if (botName === 'DISBOARD') {
+                    botConfig.bumpAttempts[channelId] = (botConfig.bumpAttempts[channelId] || 0) + 1;
                 }
                 
-                console.log(`Bumped ${botName} in channel ${channelId}!`);
-                return true; // Successfully bumped
+                // Send the slash command
+                await channel.sendSlash(botConfig.id, botConfig.command);
+                
+                if (botName === 'DISBOARD') {
+                    console.log(`📤 Sent ${botName} bump command in channel ${channelId} - ${channel.name} in ${channel.guild.name}`);
+                    console.log(`   Attempt #${botConfig.bumpAttempts[channelId]}, Successful bumps: ${botConfig.successfulBumps[channelId] || 0}`);
+                } else if (botName === 'DISCADIA') {
+                    // For Discadia, record that we attempted a bump
+                    botConfig.retryCount[channelId]++;
+                    console.log(`📤 Sent ${botName} bump command in channel ${channelId} - ${channel.name} in ${channel.guild.name}`);
+                }
+                
+                return true; // Successfully sent the command
             } else {
-                console.error(`Channel not found: ${channelId}`);
+                console.error(`❌ Channel not found: ${channelId}`);
                 return false;
             }
         } catch (error) {
-            console.error(`Error bumping ${botName} in channel ${channelId}:`, error.message);
+            console.error(`❌ Error bumping ${botName} in channel ${channelId}:`, error.message);
             return false;
         }
     }
@@ -315,11 +368,11 @@ client.on('ready', async () => {
         }
         
         // Schedule the next attempt
-        console.log(`Scheduling next Discadia bump for channel ${channelId} in ${Math.floor(nextAttemptTime / (60 * 60 * 1000))} hours and ${Math.floor((nextAttemptTime % (60 * 60 * 1000)) / (60 * 1000))} minutes ${scheduledTimeDescription}`);
+        console.log(`🗓️ Scheduling next Discadia bump for channel ${channelId} in ${Math.floor(nextAttemptTime / (60 * 60 * 1000))} hours and ${Math.floor((nextAttemptTime % (60 * 60 * 1000)) / (60 * 1000))} minutes ${scheduledTimeDescription}`);
         
         BUMP_CONFIG.DISCADIA.nextScheduledAttempt = BUMP_CONFIG.DISCADIA.nextScheduledAttempt || {};
         BUMP_CONFIG.DISCADIA.nextScheduledAttempt[channelId] = setTimeout(async () => {
-            console.log(`Executing scheduled Discadia bump for channel ${channelId}`);
+            console.log(`⏰ Executing scheduled Discadia bump for channel ${channelId}`);
             const success = await bumpBot(channelId, 'DISCADIA', BUMP_CONFIG.DISCADIA);
             
             // Schedule the next attempt regardless of success
@@ -333,7 +386,7 @@ client.on('ready', async () => {
         const checkInterval = calculateNextCheckTime();
         const minutes = Math.floor(checkInterval / 60000);
         
-        console.log(`Next regular bump check in ${minutes} minutes`);
+        console.log(`⏱️ Next regular bump check in ${minutes} minutes`);
         
         setTimeout(async () => {
             // Only bump Disboard or other regular interval services
@@ -359,10 +412,25 @@ client.on('ready', async () => {
     }
 
     // Print initial status message
-    console.log('Auto-bump bot started!');
-    console.log('Configured services:');
+    console.log('🤖 Auto-bump bot started!');
+    console.log('📋 Configured services:');
     console.log(`- Disboard: ${BUMP_CONFIG.DISBOARD.channels.length} channel(s): ${BUMP_CONFIG.DISBOARD.channels.join(', ')} (bumps every 2 hours)`);
     console.log(`- Discadia: ${BUMP_CONFIG.DISCADIA.channels.length} channel(s): ${BUMP_CONFIG.DISCADIA.channels.join(', ')} (prioritizes bumping at ${formatHour(BUMP_CONFIG.DISCADIA.bumpHour)})`);
+
+    // Add diagnostic information
+    console.log('\n🔍 Channel diagnostics:');
+    for (const channelId of BUMP_CONFIG.DISBOARD.channels) {
+        try {
+            const channel = await client.channels.fetch(channelId);
+            if (channel) {
+                console.log(`✅ Successfully accessed Disboard channel ${channelId} - ${channel.name} in ${channel.guild.name}`);
+            } else {
+                console.log(`❌ Could not get channel ${channelId} despite no error`);
+            }
+        } catch (error) {
+            console.log(`❌ Error accessing Disboard channel ${channelId}: ${error.message}`);
+        }
+    }
 
     // Initialize Discadia with targeted scheduling
     for (const channelId of BUMP_CONFIG.DISCADIA.channels) {
@@ -372,6 +440,14 @@ client.on('ready', async () => {
     // Start the regular bumping process for other services
     await bumpAllServices();
     loopRegularBumps();
+    
+    // Important information about ephemeral messages
+    console.log('\n⚠️ IMPORTANT NOTICE ABOUT DISBOARD BUMPS:');
+    console.log('- Disboard sends "cooldown" messages as ephemeral messages that only you can see');
+    console.log('- The bot CANNOT detect these ephemeral "Please wait" messages');
+    console.log('- The bot will rely on detecting successful bumps and tracking the 2-hour cooldown');
+    console.log('- You may see bump attempts in the Discord channels that appear to fail, this is normal');
+    console.log('- The bot will track which channels have had successful bumps');
 });
 
 client.login(process.env.TOKEN);
